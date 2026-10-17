@@ -22,7 +22,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
       - name: Test Stremio metadata builder
         run: node --test tests/metadata.test.mjs
       - name: Build original catalogs (unchanged)
@@ -30,7 +30,7 @@ jobs:
         env:
           TMDB_KEY: ${{ secrets.TMDB_KEY }}
           EXTRA_ANIME_IDS: '0' # Only Torrentio-compatible Kitsu / IMDb IDs
-          MAX_LOOKUPS_PER_RUN: '1500'
+          MAX_LOOKUPS_PER_RUN: '100'
           GITHUB_REPOSITORY: ${{ github.repository }}
       - name: Generate metadata and episode IDs
         run: node scripts/generate-metadata.mjs

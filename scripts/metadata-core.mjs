@@ -1,6 +1,6 @@
 // Static Stremio metadata builder for the existing HenGuys bridge.
 // No extra npm dependencies. Preserve the original title matcher and its cache.
-import { readFile, writeFile, mkdir, readdir } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 
 const KITSU = /^kitsu:[1-9]\d*$/;
@@ -134,6 +134,74 @@ export async function fetchDetails(p) {
   return {};
 }
 
+// OceanVeil-inspired compatibility: expose anime as normal Stremio series,
+// and prefer a verified IMDb ID only when the EXISTING HenGuys match cache
+// explicitly contains both a Kitsu ID and an IMDb ID for that same title.
+// Do not manufacture IMDb matches from loosely similar titles.
+export async function normalizeCatalogs(dist, matchCacheFile='cache/matches-v2.json') {
+  const manifestPath = join(dist, 'manifest.json');
+  const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
+  let matches = {};
+  try { matches = JSON.parse(await readFile(matchCacheFile, 'utf8')); } catch {}
+  const byKitsu = new Map();
+  for (const m of Object.values(matches)) {
+    const kitsu = String(m?.ids?.kitsu || '');
+    const imdb = String(m?.ids?.imdb || '');
+    if (/^[1-9]\d*$/.test(kitsu) && IMDB.test(imdb) && ['series','movie'].includes(m.imdbType)) {
+      if (!byKitsu.has(kitsu)) byKitsu.set(kitsu, { id:imdb, type:m.imdbType });
+    }
+  }
+  const grouped = new Map();
+  const stats = { animeAsSeries:0, imdbPreferred:0, duplicateItemsRemoved:0, mergedCatalogs:0 };
+  for (const catalog of manifest.catalogs || []) {
+    const { type, id } = catalog;
+    const file = join(dist,'catalog',type,`${id}.json`);
+    const data = JSON.parse(await readFile(file,'utf8'));
+    if (!Array.isArray(data.metas)) throw new Error(`Malformed catalog: ${file}`);
+    const prepared=[];
+    for (const p of data.metas) {
+      const meta={...p};
+      if (meta.id?.startsWith('kitsu:')) {
+        const imdb = byKitsu.get(meta.id.slice(6));
+        if (imdb) { meta.id=imdb.id; meta.type=imdb.type; stats.imdbPreferred++; }
+        else if (meta.type === 'anime') { meta.type='series'; stats.animeAsSeries++; }
+      } else if (meta.type === 'anime') {
+        // No unsupported anime route in the generated manifest.
+        meta.type='series'; stats.animeAsSeries++;
+      }
+      if (meta.type !== 'movie' && meta.type !== 'series') throw new Error(`Invalid type for ${meta.name}`);
+      if (!isSupportedId(meta.id)) throw new Error(`Unsupported scraper ID ${meta.id} for ${meta.name}`);
+      prepared.push(meta);
+    }
+    for (const entryType of ['series','movie']) {
+      const subset=prepared.filter(p=>p.type===entryType);
+      if (!subset.length) continue;
+      const key=`${entryType}/${id}`;
+      if (!grouped.has(key)) grouped.set(key,{ descriptor:{...catalog,type:entryType}, metas:[], seen:new Set() });
+      else stats.mergedCatalogs++;
+      const group=grouped.get(key);
+      for (const p of subset) {
+        if (group.seen.has(p.id)) { stats.duplicateItemsRemoved++; continue; }
+        group.metas.push(p); group.seen.add(p.id);
+      }
+    }
+  }
+  const catalogTypes = new Set();
+  manifest.catalogs=[];
+  for (const [key, group] of grouped) {
+    const slash=key.indexOf('/'), type=key.slice(0,slash), id=key.slice(slash+1);
+    await mkdir(join(dist,'catalog',type),{recursive:true});
+    await writeFile(join(dist,'catalog',type,`${id}.json`),JSON.stringify({metas:group.metas}));
+    manifest.catalogs.push(group.descriptor);
+    catalogTypes.add(type);
+  }
+  manifest.types=['series','movie'].filter(t=>catalogTypes.has(t));
+  await writeFile(manifestPath,JSON.stringify(manifest,null,2));
+  // Old anime files are not advertised and should not be deployed as stale routes.
+  await rm(join(dist,'catalog','anime'),{recursive:true,force:true});
+  return stats;
+}
+
 export async function readCatalogPreviews(dist) {
   const manifest = JSON.parse(await readFile(join(dist, 'manifest.json'), 'utf8'));
   const previews = new Map();
@@ -149,14 +217,19 @@ export async function readCatalogPreviews(dist) {
   return { manifest, previews };
 }
 
-export async function writeMetadata({ dist='dist', cache='cache/metadata-v1.json', repository='', maxLookups=100, fetcher=fetchDetails, now=Date.now(), log=console.log } = {}) {
+export async function writeMetadata({ dist='dist', cache='cache/metadata-v1.json', matchCache='cache/matches-v2.json', repository='', maxLookups=100, fetcher=fetchDetails, now=Date.now(), log=console.log } = {}) {
+  const routing = await normalizeCatalogs(dist,matchCache);
   const { manifest, previews } = await readCatalogPreviews(dist);
   let detailCache = {};
   try { detailCache = JSON.parse(await readFile(cache, 'utf8')); } catch { /* first build */ }
-  const stats = { records:previews.size, enriched:0, requested:0, fallback:0, failures:0 };
+  const stats = { records:previews.size, enriched:0, requested:0, fallback:0, failures:0, ...routing, typeCounts:{}, idCounts:{}, episodes:0, fallbackEpisodeCount:0 };
   // Prioritize cached data; don't block a successful publish on an external service outage.
   let failuresInRow=0;
   for (const [key, p] of previews) {
+    // v1 stored Kitsu details under anime/kitsu:; keep that expensive cache.
+    if (!detailCache[key] && key.startsWith('series/kitsu:') && detailCache[`anime/${p.id}`]) {
+      detailCache[key] = detailCache[`anime/${p.id}`];
+    }
     let entry = detailCache[key];
     const expired = !entry?.checked || now - entry.checked > (entry.failed ? 7 : 30) * 86400000;
     if (expired && stats.requested < maxLookups && failuresInRow < 5) {
@@ -168,13 +241,18 @@ export async function writeMetadata({ dist='dist', cache='cache/metadata-v1.json
     }
     const details = entry?.data || {};
     const meta = makeMeta(p, details);
+    stats.typeCounts[p.type]=(stats.typeCounts[p.type]||0)+1;
+    const group=p.id.startsWith('kitsu:')?'kitsu':'imdb';
+    stats.idCounts[group]=(stats.idCounts[group]||0)+1;
+    stats.episodes+=meta.videos?.length || 0;
+    if (meta.videos?.length===1 && meta.videos[0].released===UNKNOWN_DATE) stats.fallbackEpisodeCount++;
     if (Object.keys(details).length) stats.enriched++; else stats.fallback++;
     const dir = join(dist, 'meta', p.type);
     await mkdir(dir, { recursive:true });
     await writeFile(join(dir, `${p.id}.json`), JSON.stringify({meta}));
   }
-  manifest.resources = ['catalog', { name:'meta', types:manifest.types, idPrefixes:SUPPORTED }];
-  manifest.idPrefixes = SUPPORTED;
+  manifest.resources = ['catalog', { name:'meta', types:manifest.types, idPrefixes:['kitsu:', 'tt'] }];
+  manifest.idPrefixes = ['kitsu:', 'tt'];
   manifest.version = `1.1.${Math.floor(now/86400000)}`;
   await writeFile(join(dist, 'manifest.json'), JSON.stringify(manifest, null, 2));
   await mkdir(join(cache, '..'), { recursive:true });
@@ -185,7 +263,7 @@ export async function writeMetadata({ dist='dist', cache='cache/metadata-v1.json
     const link = `https://${base}/manifest.json`;
     await writeFile(join(dist, 'index.html'), `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Hentai Kitsu Bridge</title></head><body style="font-family:sans-serif;max-width:620px;margin:3em auto;padding:1em"><h1>Hentai Kitsu Bridge</h1><p>18+ catalog with metadata and episode IDs. Torrentio or another stream addon must be installed separately.</p><p><a href="stremio://${base}/manifest.json">Install in Stremio</a></p><p>Manifest: <a href="${link}">${link}</a></p></body></html>`);
   }
-  await writeFile(join(dist, 'metadata-status.json'), JSON.stringify({ ...stats, generatedAt:new Date(now).toISOString() }, null, 2));
+  await writeFile(join(dist, 'metadata-status.json'), JSON.stringify({ ...stats, generatedAt:new Date(now).toISOString(), caveat:'Valid episode IDs are not proof that Torrentio has matching torrents. Unknown episodes may be placeholders.' }, null, 2));
   await validateStaticAddon(dist);
   log(`Metadata ready: ${JSON.stringify(stats)}`);
   return stats;
@@ -194,6 +272,7 @@ export async function writeMetadata({ dist='dist', cache='cache/metadata-v1.json
 export async function validateStaticAddon(dist='dist') {
   const { manifest, previews } = await readCatalogPreviews(dist);
   if (!manifest.resources.some(r => (typeof r === 'string' ? r : r.name) === 'meta')) throw new Error('Manifest has no meta resource');
+  if (manifest.catalogs.some(c=>c.type==='anime')) throw new Error('Legacy anime route still advertised; expected series');
   for (const [key, p] of previews) {
     const [type, id] = key.split('/');
     const { meta } = JSON.parse(await readFile(join(dist, 'meta', type, `${id}.json`), 'utf8'));

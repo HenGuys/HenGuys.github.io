@@ -12,7 +12,7 @@ test('supports Kitsu/IMDb; rejects identifiers Torrentio cannot receive', () => 
 });
 
 test('Kitsu IDs provide per-episode stream IDs, not just posters', () => {
-  const meta = makeMeta({id:'kitsu:42766',type:'anime',name:'Example Anime',poster:'https://example.com/p.jpg'},
+  const meta = makeMeta({id:'kitsu:42766',type:'series',name:'Example Anime',poster:'https://example.com/p.jpg'},
     {episodeCount:3,startDate:'2020-01-01',synopsis:'Some text'});
   assert.deepEqual(meta.videos.map(v=>v.id), ['kitsu:42766:1','kitsu:42766:2','kitsu:42766:3']);
   assert.equal(meta.videos[0].released, '2020-01-01T00:00:00.000Z');
@@ -41,11 +41,14 @@ test('full offline overlay builds metadata matching every catalog item', async (
     await writeFile(join(dist,'manifest.json'),JSON.stringify({id:'test',types:['anime','movie'],resources:['catalog'],catalogs}));
     await writeFile(join(dist,'catalog','anime','hkb-top.json'),JSON.stringify({metas:[{id:'kitsu:42766',type:'anime',name:'Example',poster:'https://example.com/p.jpg'}]}));
     await writeFile(join(dist,'catalog','movie','hkb-top.json'),JSON.stringify({metas:[{id:'tt7654321',type:'movie',name:'Movie'}]}));
-    const stats=await writeMetadata({dist,cache,repository:'HenGuys/HenGuys.github.io', maxLookups:2,fetcher:async p=>p.type==='anime'? {episodeCount:2,startDate:'2020-01-01'} : {startDate:'2021-01-01'},log:()=>{}});
+    const stats=await writeMetadata({dist,cache,repository:'HenGuys/HenGuys.github.io', maxLookups:2,fetcher:async p=>p.id.startsWith('kitsu:')? {episodeCount:2,startDate:'2020-01-01'} : {startDate:'2021-01-01'},log:()=>{}});
     assert.equal(stats.records,2);
     const m=JSON.parse(await readFile(join(dist,'manifest.json'),'utf8'));
     assert.ok(m.resources.some(r=>r.name==='meta'));
-    const d=JSON.parse(await readFile(join(dist,'meta','anime','kitsu:42766.json'),'utf8'));
+    assert.equal(m.catalogs.some(c=>c.type==='anime'),false);
+    assert.ok(m.catalogs.some(c=>c.type==='series'));
+    assert.ok(m.types.includes('series'));
+    const d=JSON.parse(await readFile(join(dist,'meta','series','kitsu:42766.json'),'utf8'));
     assert.equal(d.meta.videos[1].id,'kitsu:42766:2');
     await validateStaticAddon(dist);
     assert.match(await readFile(join(dist,'index.html'),'utf8'), /https:\/\/henguys\.github\.io\/manifest\.json/);
@@ -60,9 +63,50 @@ test('fallback detail includes a playable-format Kitsu episode without network a
     await writeFile(join(dist,'manifest.json'),JSON.stringify({id:'test',types:['anime'],resources:['catalog'],catalogs:[{type:'anime',id:'all'}]}));
     await writeFile(join(dist,'catalog','anime','all.json'),JSON.stringify({metas:[{id:'kitsu:46028',name:'Another Anime',type:'anime'}]}));
     await writeMetadata({dist, cache:join(root,'cache','meta.json'),maxLookups:0,log:()=>{}});
-    const {meta}=JSON.parse(await readFile(join(dist,'meta','anime','kitsu:46028.json'),'utf8'));
+    const {meta}=JSON.parse(await readFile(join(dist,'meta','series','kitsu:46028.json'),'utf8'));
     assert.equal(meta.videos[0].id,'kitsu:46028:1');
     assert.equal(meta.videos.length,1);
     assert.equal(meta.videos[0].released,'1970-01-01T00:00:00.000Z');
+  } finally { await rm(root,{recursive:true,force:true}); }
+});
+
+
+test('merges legacy anime and series catalogs instead of dropping either set', async () => {
+  const root=await mkdtemp(join(tmpdir(),'henbridge-merge-'));
+  try {
+    const dist=join(root,'dist');
+    await mkdir(join(dist,'catalog','anime'),{recursive:true});
+    await mkdir(join(dist,'catalog','series'),{recursive:true});
+    await writeFile(join(dist,'manifest.json'),JSON.stringify({id:'test',types:['anime','series'],resources:['catalog'],catalogs:[{type:'anime',id:'all',name:'All'},{type:'series',id:'all',name:'All'}]}));
+    await writeFile(join(dist,'catalog','anime','all.json'),JSON.stringify({metas:[{id:'kitsu:11',type:'anime',name:'Kitsu show'}]}));
+    await writeFile(join(dist,'catalog','series','all.json'),JSON.stringify({metas:[{id:'tt1234567',type:'series',name:'IMDb show'}]}));
+    const stats=await writeMetadata({dist,cache:join(root,'cache','details.json'),matchCache:join(root,'cache','matches.json'),maxLookups:0,log:()=>{}});
+    assert.equal(stats.records,2);
+    assert.equal(stats.mergedCatalogs,1);
+    const manifest=JSON.parse(await readFile(join(dist,'manifest.json'),'utf8'));
+    assert.deepEqual(manifest.types,['series']);
+    assert.equal(manifest.catalogs.length,1);
+    const data=JSON.parse(await readFile(join(dist,'catalog','series','all.json'),'utf8'));
+    assert.deepEqual(data.metas.map(m=>m.id),['kitsu:11','tt1234567']);
+    assert.ok((await readFile(join(dist,'meta','series','kitsu:11.json'),'utf8')).includes('kitsu:11:1'));
+    await validateStaticAddon(dist);
+  } finally { await rm(root,{recursive:true,force:true}); }
+});
+
+test('promotes ONLY an explicitly cached, paired IMDb ID; no fuzzy replacement', async () => {
+  const root=await mkdtemp(join(tmpdir(),'henbridge-imdb-'));
+  try {
+    const dist=join(root,'dist');
+    await mkdir(join(dist,'catalog','anime'),{recursive:true});
+    const matches=join(root,'cache','matches-v2.json');
+    await mkdir(join(root,'cache'),{recursive:true});
+    await writeFile(matches,JSON.stringify({show1:{ids:{kitsu:'22',imdb:'tt1234567'},imdbType:'series'},show2:{ids:{kitsu:'33',imdb:'tt7654321'},imdbType:'other'}}));
+    await writeFile(join(dist,'manifest.json'),JSON.stringify({id:'test',types:['anime'],resources:['catalog'],catalogs:[{type:'anime',id:'all'}]}));
+    await writeFile(join(dist,'catalog','anime','all.json'),JSON.stringify({metas:[{id:'kitsu:22',type:'anime',name:'Paired'},{id:'kitsu:33',type:'anime',name:'Unverified'}]}));
+    const stats=await writeMetadata({dist,cache:join(root,'cache','details.json'),matchCache:matches,maxLookups:0,log:()=>{}});
+    assert.equal(stats.imdbPreferred,1);
+    const metas=JSON.parse(await readFile(join(dist,'catalog','series','all.json'),'utf8')).metas;
+    assert.deepEqual(metas.map(m=>m.id),['tt1234567','kitsu:33']);
+    await validateStaticAddon(dist);
   } finally { await rm(root,{recursive:true,force:true}); }
 });
