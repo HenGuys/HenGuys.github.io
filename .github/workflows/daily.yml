@@ -2,8 +2,30 @@ name: Build and deploy
 
 on:
   schedule:
-    - cron: '17 3 * * *'   # daily, 03:17 UTC
+    - cron: '17 3 * * *' # daily 03:17 UTC
   workflow_dispatch:
+    inputs:
+      refresh_mode:
+        description: 'Cache: refresh expired or ALL (batch-limited)'
+        type: choice
+        required: true
+        default: stale
+        options:
+          - stale
+          - all
+      force_titles:
+        description: 'Optional comma-separated source titles to refresh first'
+        type: string
+        required: false
+        default: ''
+      max_lookups:
+        description: 'Maximum title rematches during this run'
+        type: choice
+        required: true
+        default: '100'
+        options:
+          - '100'
+          - '250'
   push:
     branches: [main]
 
@@ -15,6 +37,7 @@ permissions:
 concurrency:
   group: pages
   cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -23,14 +46,21 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-      - name: Test Stremio metadata builder
-        run: node --test tests/metadata.test.mjs
-      - name: Build original catalogs (unchanged)
+      - name: Test matching, cache migration and Stremio metadata
+        run: node --test tests/*.test.mjs
+      - name: Upgrade original matcher to refresh stale matches
+        run: node scripts/install-cache-policy.mjs
+      - name: Build original catalogs with cache refresh
         run: node build.mjs
         env:
           TMDB_KEY: ${{ secrets.TMDB_KEY }}
-          EXTRA_ANIME_IDS: '0' # Only Torrentio-compatible Kitsu / IMDb IDs
-          MAX_LOOKUPS_PER_RUN: '100'
+          EXTRA_ANIME_IDS: '0'
+          MAX_LOOKUPS_PER_RUN: ${{ inputs.max_lookups || '100' }}
+          CACHE_REFRESH_MODE: ${{ inputs.refresh_mode || 'stale' }}
+          CACHE_FORCE_TITLES: ${{ inputs.force_titles || '' }}
+          CACHE_MATCH_TTL_DAYS: '14'
+          CACHE_MISS_TTL_DAYS: '3'
+          CACHE_RETRY_COOLDOWN_HOURS: '48'
           GITHUB_REPOSITORY: ${{ github.repository }}
       - name: Generate metadata and episode IDs
         run: node scripts/generate-metadata.mjs
@@ -39,12 +69,12 @@ jobs:
           METADATA_LOOKUPS_PER_RUN: '100'
       - name: Validate every generated detail page
         run: node scripts/check-metadata.mjs
-      - name: Commit match and metadata caches
+      - name: Commit matching, metadata caches and upgraded builder
         run: |
           git config user.name "github-actions"
           git config user.email "actions@users.noreply.github.com"
-          git add cache
-          git diff --cached --quiet || (git commit -m "Update match and metadata caches" && git push)
+          git add cache build.mjs
+          git diff --cached --quiet || (git commit -m "Refresh and revalidate cached title matches" && git push)
       - uses: actions/upload-pages-artifact@v3
         with:
           path: dist

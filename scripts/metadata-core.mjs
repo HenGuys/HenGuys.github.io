@@ -253,7 +253,7 @@ export async function writeMetadata({ dist='dist', cache='cache/metadata-v1.json
   }
   manifest.resources = ['catalog', { name:'meta', types:manifest.types, idPrefixes:['kitsu:', 'tt'] }];
   manifest.idPrefixes = ['kitsu:', 'tt'];
-  manifest.version = `1.1.${Math.floor(now/86400000)}`;
+  manifest.version = `1.2.${Math.floor(now/60000)}`; // Bump on each build minute to invalidate stale client manifests.
   await writeFile(join(dist, 'manifest.json'), JSON.stringify(manifest, null, 2));
   await mkdir(join(cache, '..'), { recursive:true });
   await writeFile(cache, JSON.stringify(detailCache));
