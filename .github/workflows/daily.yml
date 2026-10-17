@@ -3,7 +3,7 @@ name: Build and deploy
 on:
   schedule:
     - cron: '17 3 * * *'   # daily, 03:17 UTC
-  workflow_dispatch:        # manual "Run workflow" button
+  workflow_dispatch:
   push:
     branches: [main]
 
@@ -15,7 +15,6 @@ permissions:
 concurrency:
   group: pages
   cancel-in-progress: true
-
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -24,22 +23,31 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - run: node build.mjs
+      - name: Test Stremio metadata builder
+        run: node --test tests/metadata.test.mjs
+      - name: Build original catalogs (unchanged)
+        run: node build.mjs
         env:
-          TMDB_KEY: ${{ secrets.TMDB_KEY }}   # optional
-          EXTRA_ANIME_IDS: '0'                 # set to '1' to allow mal:/anilist: IDs
+          TMDB_KEY: ${{ secrets.TMDB_KEY }}
+          EXTRA_ANIME_IDS: '0' # Only Torrentio-compatible Kitsu / IMDb IDs
           MAX_LOOKUPS_PER_RUN: '1500'
           GITHUB_REPOSITORY: ${{ github.repository }}
-      - name: Commit match cache
+      - name: Generate metadata and episode IDs
+        run: node scripts/generate-metadata.mjs
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          METADATA_LOOKUPS_PER_RUN: '100'
+      - name: Validate every generated detail page
+        run: node scripts/check-metadata.mjs
+      - name: Commit match and metadata caches
         run: |
           git config user.name "github-actions"
           git config user.email "actions@users.noreply.github.com"
           git add cache
-          git diff --cached --quiet || (git commit -m "Update match cache" && git push)
+          git diff --cached --quiet || (git commit -m "Update match and metadata caches" && git push)
       - uses: actions/upload-pages-artifact@v3
         with:
           path: dist
-
   deploy:
     needs: build
     runs-on: ubuntu-latest
