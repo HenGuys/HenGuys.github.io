@@ -2,6 +2,7 @@
 // mapping each title to IDs your scraper addons understand (Kitsu > IMDb > MAL/AniList).
 // Run daily by GitHub Actions; output goes to ./dist and is deployed to GitHub Pages.
 import { mkdir, writeFile, readFile } from 'node:fs/promises';
+import { refreshQueue, applyMatchRefresh } from './scripts/cache-policy.mjs';
 
 const SOURCE = (process.env.SOURCE_ADDON || 'https://hentaistream-addon.keypop3750.workers.dev').replace(/\/$/, '');
 const TMDB_KEY = process.env.TMDB_KEY || '';                   // optional, enables IMDb fallback
@@ -192,21 +193,34 @@ for (const sc of SOURCE_CATALOGS) {
 }
 if (!Object.values(catalogs).some((a) => a.length)) { console.error('Source returned nothing; keeping previous deployment.'); process.exit(1); }
 
-const now = Date.now(); let lookups = 0, deferred = 0;
-for (const items of Object.values(catalogs)) {
-  for (const m of items) {
-    const key = norm(m.name); if (!key) continue;
-    const c = cache[key];
-    const stale = c && !pickId(c) && now - c.checked > RETRY_MISS_DAYS * 864e5;
-    if (c && !stale) continue;
-    if (lookups >= MAX_LOOKUPS) { deferred++; continue; }
-    lookups++;
-    cache[key] = await resolve(m.name);
-    const p = pickId(cache[key]);
-    console.log(`${p ? 'MATCH' : 'miss '} ${m.name} -> ${p?.id ?? '-'}`);
-  }
+// HenGuys cache refresh policy v3
+const now = Date.now(); let lookups = 0;
+const candidates = refreshQueue({ catalogs, cache, norm, pickId, now, env: process.env });
+const refreshStats = { candidates:candidates.length, attempted:0, deferred:0, newMatches:0,
+  revalidated:0, updatedIds:0, retainedExisting:0, missed:0, reasons:{} };
+for (const task of candidates.slice(0, MAX_LOOKUPS)) {
+  lookups++;
+  const previous = cache[task.key];
+  const incoming = await resolve(task.title);
+  const { entry, outcome } = applyMatchRefresh({previous, incoming, pickId, now:Date.now()});
+  cache[task.key] = entry;
+  refreshStats.attempted++;
+  refreshStats.reasons[task.reason] = (refreshStats.reasons[task.reason] || 0) + 1;
+  if (outcome === 'new-match') refreshStats.newMatches++;
+  else if (outcome === 'revalidated') refreshStats.revalidated++;
+  else if (outcome === 'updated-id') refreshStats.updatedIds++;
+  else if (outcome === 'retained-existing') refreshStats.retainedExisting++;
+  else refreshStats.missed++;
+  console.log('CACHE ' + outcome + ' [' + task.reason + '] ' + task.title + ' => ' + (pickId(entry)?.id ?? '-'));
 }
-if (deferred) console.log(`${deferred} titles deferred to the next run (MAX_LOOKUPS_PER_RUN=${MAX_LOOKUPS}).`);
+refreshStats.deferred = Math.max(0, candidates.length - lookups);
+if (refreshStats.deferred) console.log(refreshStats.deferred + ' title lookups deferred to the next run.');
+await mkdir('dist', { recursive:true });
+await writeFile('dist/cache-refresh-status.json', JSON.stringify({ ...refreshStats,
+  policyVersion:3, generatedAt:new Date().toISOString(),
+  mode:process.env.CACHE_REFRESH_MODE || 'stale',
+  note:'The existing cache is retained; previously matched titles are revalidated in batches.' }, null, 2));
+console.log('CACHE REFRESH SUMMARY', JSON.stringify(refreshStats));
 
 // build catalogs grouped by stremio type
 const out = {}; const prefixes = new Set(); const stats = {};
